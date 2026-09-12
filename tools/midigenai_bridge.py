@@ -11,44 +11,102 @@ Reads JSON config from stdin:
     "max_new_tokens": 256, "temperature": 1.2, "top_k": 50,
     "prompt_end_beat": 32.0,           # filter output to notes after this beat
     "pitch_range": [60, 96],           # optional pitch filter
-    "version": "v2-100m",              # which subfolder of the HF repo to load
-                                       # (default: $MIDIGENAI_VERSION env var, then midigenai's DEFAULT_VERSION)
-    "repo_id": "nicholasbien/midigenai" # default: $MIDIGENAI_REPO_ID, then "nicholasbien/midigenai"
+    "version": "v2-pilot",             # pinned model subfolder
+    "revision": "71347f...",           # pinned immutable HF revision
+    "repo_id": "nicholasbien/midigenai" # pinned model repository
   }
 
 Writes JSON to stdout:
   {"prompt_tokens": int, "generated_tokens": int, "tempo_bpm": float,
    "notes": [{"pitch", "start_time", "duration", "velocity"}, ...]}
 
-Switching to a new model release in the future:
-  1. Push the new model to a new subfolder on the HF repo
-  2. Either bump `MIDIGENAI_VERSION` env var (no code change), pass
-     `"version"` in the JSON payload, or update midigenai's
-     `v2/hub.py::DEFAULT_VERSION`. Whichever is most convenient.
+Switching to a new model release requires a security review, an immutable
+revision, and updated SHA-256 constants in this file.
 
 Run with whatever Python env has the `[ai]` extras installed:
-  pip install "ableton-mcp-pro[ai]"
+  python -m pip install -r pylock.ai.toml
   python tools/midigenai_bridge.py < cfg.json
 """
 
 import json
+import hashlib
+import os
 import sys
 import tempfile
 from pathlib import Path
 
 TPQ = 480
 
+PINNED_MODEL_REPO = "nicholasbien/midigenai"
+PINNED_MODEL_VERSION = "v2-pilot"
+PINNED_MODEL_REVISION = "71347f047227c835002a0b7e05c47b08af0b0984"
+PINNED_CHECKPOINT_SHA256 = "e697c407f40bf58a7cc8f7d6a417be9819d3bdbd33c2104f9ac43e509d5f86d5"
+PINNED_TOKENIZER_SHA256 = "13744f902aded08d3ec03378565a9b8e20c56fbf9eb45a6c067c77df9de3bd03"
+
+
+def _env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
 # Lazy global so repeated calls in the same process don't reload the model
 _GENERATOR = None
 
 
-def _get_generator(repo_id, version):
-    """Cache one generator per (repo_id, version) tuple."""
+def _get_generator(repo_id, version, revision):
+    """Download a pinned model, verify it, and load it with restricted unpickling."""
     global _GENERATOR
-    cache_key = (repo_id, version)
+    requested = (
+        repo_id or PINNED_MODEL_REPO,
+        version or PINNED_MODEL_VERSION,
+        revision or PINNED_MODEL_REVISION,
+    )
+    pinned = (PINNED_MODEL_REPO, PINNED_MODEL_VERSION, PINNED_MODEL_REVISION)
+    custom_source = requested != pinned
+    if custom_source and not _env_flag("ABLETON_MCP_ALLOW_CUSTOM_MODEL_SOURCE"):
+        raise ValueError(
+            "Custom model sources are disabled. Set "
+            "ABLETON_MCP_ALLOW_CUSTOM_MODEL_SOURCE=1 only after auditing the source."
+        )
+
+    cache_key = requested
     if _GENERATOR is None or _GENERATOR[0] != cache_key:
-        from midigenai import load_v2_from_hub
-        gen = load_v2_from_hub(version=version, repo_id=repo_id)
+        from midigenai import V2Generator, download_v2_files
+        checkpoint, tokenizer = download_v2_files(
+            repo_id=requested[0], version=requested[1], revision=requested[2]
+        )
+        if not custom_source:
+            actual_checkpoint_hash = _sha256(checkpoint)
+            actual_tokenizer_hash = _sha256(tokenizer)
+            if actual_checkpoint_hash != PINNED_CHECKPOINT_SHA256:
+                raise RuntimeError("Pinned model checkpoint SHA-256 mismatch")
+            if actual_tokenizer_hash != PINNED_TOKENIZER_SHA256:
+                raise RuntimeError("Pinned tokenizer SHA-256 mismatch")
+
+        # The dependency currently asks torch.load for unrestricted pickle loading.
+        # Override that one call so downloaded checkpoints can only use the restricted
+        # weights-only unpickler, then immediately restore torch.load.
+        import torch
+        original_torch_load = torch.load
+
+        def restricted_torch_load(*args, **kwargs):
+            kwargs["weights_only"] = True
+            return original_torch_load(*args, **kwargs)
+
+        try:
+            torch.load = restricted_torch_load
+            gen = V2Generator(checkpoint_path=checkpoint, tokenizer_path=tokenizer)
+        finally:
+            torch.load = original_torch_load
         _GENERATOR = (cache_key, gen)
     return _GENERATOR[1]
 
@@ -111,16 +169,18 @@ def main():
     if prompt_end_beat is not None:
         prompt_end_beat = float(prompt_end_beat)
     pitch_range = cfg.get("pitch_range")
-    # version/repo_id default to None — midigenai resolves env vars + DEFAULT_VERSION
+    # Defaults resolve to audited, immutable constants above. Caller-selected model
+    # sources are rejected unless ABLETON_MCP_ALLOW_CUSTOM_MODEL_SOURCE=1.
     version = cfg.get("version")
     repo_id = cfg.get("repo_id")
+    revision = cfg.get("revision")
 
     score = notes_to_score(notes, tempo)
     with tempfile.NamedTemporaryFile(suffix=".mid", delete=False) as f:
         in_path = f.name
     score.dump_midi(in_path)
 
-    gen = _get_generator(repo_id, version)
+    gen = _get_generator(repo_id, version, revision)
     prompt_ids = gen.encode_midi_file(in_path)
 
     out_path = in_path.replace(".mid", "_out.mid")

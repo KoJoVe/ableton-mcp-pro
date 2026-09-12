@@ -1,5 +1,6 @@
 # ableton_mcp_server.py
 from mcp.server.fastmcp import FastMCP, Context
+import os
 import socket
 import json
 import logging
@@ -11,6 +12,57 @@ from typing import AsyncIterator, Dict, Any, List, Optional, Union
 logging.basicConfig(level=logging.INFO, 
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("AbletonMCPServer")
+
+MAX_COMMAND_BYTES = 1024 * 1024
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Safe by default. These values are evaluated when the MCP process starts.
+READ_ONLY_MODE = _env_flag("ABLETON_MCP_READ_ONLY", True)
+ALLOW_DESTRUCTIVE = _env_flag("ABLETON_MCP_ALLOW_DESTRUCTIVE", False)
+REDACT_FILE_PATHS = _env_flag("ABLETON_MCP_REDACT_FILE_PATHS", True)
+
+MODIFYING_COMMANDS = {
+    "create_midi_track", "create_audio_track", "set_track_name",
+    "create_clip", "create_audio_clip", "create_arrangement_audio_clip",
+    "create_arrangement_midi_clip", "delete_arrangement_clip",
+    "add_notes_to_clip", "set_clip_name", "set_tempo", "fire_clip",
+    "stop_clip", "set_device_parameter", "batch_set_device_parameters",
+    "start_playback", "stop_playback", "load_instrument_or_effect",
+    "load_browser_item", "set_track_volume", "set_track_panning",
+    "fire_scene", "set_song_time", "set_record_mode",
+    "set_arrangement_overdub", "set_back_to_arranger",
+    "set_arrangement_loop", "set_track_mute", "set_track_solo",
+    "delete_clip", "duplicate_clip", "create_scene", "delete_scene",
+    "set_scene_name", "delete_track", "record_arrangement",
+    "delete_device", "duplicate_track", "set_clip_loop", "set_track_arm",
+    "set_send_level", "set_time_signature", "set_track_monitoring",
+    "set_track_input_routing", "set_track_output_routing", "set_metronome",
+    "set_clip_envelope", "clear_clip_envelope", "undo", "redo",
+}
+
+DESTRUCTIVE_COMMANDS = {
+    "delete_arrangement_clip", "delete_clip", "delete_scene", "delete_track",
+    "delete_device", "clear_clip_envelope",
+}
+
+
+def _redact_sensitive(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: ("<redacted>" if key == "file_path" else _redact_sensitive(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_sensitive(item) for item in value]
+    return value
 
 @dataclass
 class AbletonConnection:
@@ -47,6 +99,7 @@ class AbletonConnection:
         """Receive the complete response, potentially in multiple chunks.
         Uses whatever timeout is already set on the socket."""
         chunks = []
+        total_size = 0
         
         try:
             while True:
@@ -58,6 +111,11 @@ class AbletonConnection:
                         break
                     
                     chunks.append(chunk)
+                    total_size += len(chunk)
+                    if total_size > MAX_RESPONSE_BYTES:
+                        raise ValueError(
+                            f"Ableton response exceeds {MAX_RESPONSE_BYTES} byte limit"
+                        )
                     
                     # Check if we've received a complete JSON object
                     try:
@@ -92,44 +150,43 @@ class AbletonConnection:
 
     def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
         """Send a command to Ableton and return the response"""
+        params = params or {}
+        is_modifying_command = command_type in MODIFYING_COMMANDS
+        if is_modifying_command and READ_ONLY_MODE:
+            raise PermissionError(
+                "Blocked by read-only mode. Restart the MCP server with "
+                "ABLETON_MCP_READ_ONLY=0 to allow changes."
+            )
+        if command_type in DESTRUCTIVE_COMMANDS:
+            if not ALLOW_DESTRUCTIVE:
+                raise PermissionError(
+                    "Destructive operations are disabled. Restart the MCP server with "
+                    "ABLETON_MCP_ALLOW_DESTRUCTIVE=1 to enable them."
+                )
+            if params.get("confirm_destructive") is not True:
+                raise PermissionError(
+                    "Destructive operation requires confirm_destructive=true."
+                )
+
+        command = {
+            "type": command_type,
+            "params": params,
+        }
+
+        command_data = json.dumps(command).encode("utf-8")
+        if len(command_data) > MAX_COMMAND_BYTES:
+            raise ValueError(f"Command exceeds {MAX_COMMAND_BYTES} byte limit")
+
         if not self.sock and not self.connect():
             raise ConnectionError("Not connected to Ableton")
         
-        command = {
-            "type": command_type,
-            "params": params or {}
-        }
-        
-        # Check if this is a state-modifying command
-        is_modifying_command = command_type in [
-            "create_midi_track", "create_audio_track", "set_track_name",
-            "create_clip", "create_audio_clip", "create_arrangement_audio_clip",
-            "create_arrangement_midi_clip", "delete_arrangement_clip",
-            "add_notes_to_clip", "set_clip_name",
-            "set_tempo", "fire_clip", "stop_clip", "set_device_parameter",
-            "batch_set_device_parameters",
-            "start_playback", "stop_playback", "load_instrument_or_effect",
-            "load_browser_item", "set_track_volume", "set_track_panning",
-            "fire_scene", "set_song_time", "set_record_mode",
-            "set_arrangement_overdub", "set_back_to_arranger",
-            "set_arrangement_loop",
-            "set_track_mute", "set_track_solo",
-            "delete_clip", "duplicate_clip",
-            "create_scene", "delete_scene", "set_scene_name",
-            "delete_track", "record_arrangement",
-            "delete_device", "duplicate_track", "set_clip_loop",
-            "set_track_arm", "set_send_level", "set_time_signature",
-            "set_track_monitoring", "get_track_routing",
-            "set_track_input_routing", "set_track_output_routing", "set_metronome",
-            "set_clip_envelope", "clear_clip_envelope",
-            "undo", "redo"
-        ]
-        
         try:
-            logger.info(f"Sending command: {command_type} with params: {params}")
+            # Do not log parameters: they can contain confidential track names,
+            # notes, routing details, or absolute file paths.
+            logger.info(f"Sending command: {command_type}")
             
             # Send the command
-            self.sock.sendall(json.dumps(command).encode('utf-8'))
+            self.sock.sendall(command_data)
             logger.info(f"Command sent, waiting for response...")
             
             # For state-modifying commands, add a small delay to give Ableton time to process
@@ -163,7 +220,8 @@ class AbletonConnection:
                 import time
                 time.sleep(0.1)  # 100ms delay
             
-            return response.get("result", {})
+            result = response.get("result", {})
+            return _redact_sensitive(result) if REDACT_FILE_PATHS else result
         except socket.timeout:
             logger.error("Socket timeout while waiting for response from Ableton")
             self.sock = None
@@ -279,6 +337,27 @@ def get_ableton_connection():
 
 
 # Core Tool endpoints
+
+@mcp.tool()
+def get_security_status(ctx: Context) -> str:
+    """Report safety controls for both the MCP server and Ableton Remote Script."""
+    local_status = {
+        "read_only": READ_ONLY_MODE,
+        "destructive_operations_enabled": ALLOW_DESTRUCTIVE,
+        "destructive_confirmation_required": True,
+        "file_paths_redacted": REDACT_FILE_PATHS,
+        "max_command_bytes": MAX_COMMAND_BYTES,
+        "max_response_bytes": MAX_RESPONSE_BYTES,
+    }
+    try:
+        remote_status = get_ableton_connection().send_command("get_security_status")
+    except Exception as error:
+        remote_status = {"unavailable": str(error)}
+    return json.dumps({
+        "mcp_server": local_status,
+        "ableton_remote_script": remote_status,
+    }, indent=2)
+
 
 @mcp.tool()
 def get_session_info(ctx: Context) -> str:
@@ -407,19 +486,26 @@ def get_arrangement_clip_notes(ctx: Context, track_index: int, arrangement_clip_
         return f"Error getting arrangement clip notes: {str(e)}"
 
 @mcp.tool()
-def delete_arrangement_clip(ctx: Context, track_index: int, arrangement_clip_index: int) -> str:
+def delete_arrangement_clip(
+    ctx: Context,
+    track_index: int,
+    arrangement_clip_index: int,
+    confirm_destructive: bool = False,
+) -> str:
     """
     Delete a clip from the arrangement view by track + index.
 
     Parameters:
     - track_index: Index of the track
     - arrangement_clip_index: Index into track.arrangement_clips (0 = first clip)
+    - confirm_destructive: Must be true after the user explicitly confirms deletion
     """
     try:
         ableton = get_ableton_connection()
         result = ableton.send_command("delete_arrangement_clip", {
             "track_index": track_index,
             "arrangement_clip_index": arrangement_clip_index,
+            "confirm_destructive": confirm_destructive,
         })
         return f"Deleted arrangement clip {result.get('deleted_index')} on track {track_index} ({result.get('remaining_count', 0)} remaining)"
     except Exception as e:
@@ -1123,19 +1209,26 @@ def set_track_solo(ctx: Context, track_index: int, solo: bool) -> str:
         return f"Error setting track solo: {str(e)}"
 
 @mcp.tool()
-def delete_clip(ctx: Context, track_index: int, clip_index: int) -> str:
+def delete_clip(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    confirm_destructive: bool = False,
+) -> str:
     """
     Delete a clip from a clip slot.
 
     Parameters:
     - track_index: The index of the track containing the clip
     - clip_index: The index of the clip slot
+    - confirm_destructive: Must be true after the user explicitly confirms deletion
     """
     try:
         ableton = get_ableton_connection()
         result = ableton.send_command("delete_clip", {
             "track_index": track_index,
-            "clip_index": clip_index
+            "clip_index": clip_index,
+            "confirm_destructive": confirm_destructive,
         })
         return f"Deleted clip at track {track_index}, slot {clip_index}"
     except Exception as e:
@@ -1222,17 +1315,23 @@ def create_audio_track(ctx: Context, index: int = -1) -> str:
         return f"Error creating audio track: {str(e)}"
 
 @mcp.tool()
-def delete_track(ctx: Context, track_index: int) -> str:
+def delete_track(
+    ctx: Context,
+    track_index: int,
+    confirm_destructive: bool = False,
+) -> str:
     """
     Delete a track.
 
     Parameters:
     - track_index: The index of the track to delete
+    - confirm_destructive: Must be true after the user explicitly confirms deletion
     """
     try:
         ableton = get_ableton_connection()
         result = ableton.send_command("delete_track", {
-            "track_index": track_index
+            "track_index": track_index,
+            "confirm_destructive": confirm_destructive,
         })
         return f"Deleted track '{result.get('deleted_track', '')}' (remaining: {result.get('track_count', '?')} tracks)"
     except Exception as e:
@@ -1302,17 +1401,23 @@ def get_full_arrangement(ctx: Context) -> str:
         return f"Error getting full arrangement: {str(e)}"
 
 @mcp.tool()
-def delete_scene(ctx: Context, scene_index: int) -> str:
+def delete_scene(
+    ctx: Context,
+    scene_index: int,
+    confirm_destructive: bool = False,
+) -> str:
     """
     Delete a scene.
 
     Parameters:
     - scene_index: The index of the scene to delete
+    - confirm_destructive: Must be true after the user explicitly confirms deletion
     """
     try:
         ableton = get_ableton_connection()
         result = ableton.send_command("delete_scene", {
-            "scene_index": scene_index
+            "scene_index": scene_index,
+            "confirm_destructive": confirm_destructive,
         })
         return f"Deleted scene '{result.get('deleted_scene', '')}' (remaining: {result.get('scene_count', '?')} scenes)"
     except Exception as e:
@@ -1320,19 +1425,26 @@ def delete_scene(ctx: Context, scene_index: int) -> str:
         return f"Error deleting scene: {str(e)}"
 
 @mcp.tool()
-def delete_device(ctx: Context, track_index: int, device_index: int) -> str:
+def delete_device(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    confirm_destructive: bool = False,
+) -> str:
     """
     Delete a device from a track.
 
     Parameters:
     - track_index: The index of the track (use -1 for master, -2/-3 for returns)
     - device_index: The index of the device to delete
+    - confirm_destructive: Must be true after the user explicitly confirms deletion
     """
     try:
         ableton = get_ableton_connection()
         result = ableton.send_command("delete_device", {
             "track_index": track_index,
-            "device_index": device_index
+            "device_index": device_index,
+            "confirm_destructive": confirm_destructive,
         })
         return f"Deleted device '{result.get('deleted_device', '')}' ({result.get('device_count', '?')} devices remaining)"
     except Exception as e:
@@ -1535,7 +1647,14 @@ def get_clip_envelope(ctx: Context, track_index: int, clip_index: int, device_in
         return f"Error getting clip envelope: {str(e)}"
 
 @mcp.tool()
-def clear_clip_envelope(ctx: Context, track_index: int, clip_index: int, device_index: int, parameter_index: int) -> str:
+def clear_clip_envelope(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    device_index: int,
+    parameter_index: int,
+    confirm_destructive: bool = False,
+) -> str:
     """
     Clear automation envelope for a parameter in a clip.
 
@@ -1544,6 +1663,7 @@ def clear_clip_envelope(ctx: Context, track_index: int, clip_index: int, device_
     - clip_index: The index of the clip slot
     - device_index: The index of the device
     - parameter_index: The index of the parameter
+    - confirm_destructive: Must be true after the user explicitly confirms clearing
     """
     try:
         ableton = get_ableton_connection()
@@ -1551,7 +1671,8 @@ def clear_clip_envelope(ctx: Context, track_index: int, clip_index: int, device_
             "track_index": track_index,
             "clip_index": clip_index,
             "device_index": device_index,
-            "parameter_index": parameter_index
+            "parameter_index": parameter_index,
+            "confirm_destructive": confirm_destructive,
         })
         return f"Cleared automation for '{result.get('parameter_name', '')}'"
     except Exception as e:
