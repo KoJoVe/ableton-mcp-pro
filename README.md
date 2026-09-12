@@ -67,14 +67,61 @@ See the [Skill Authoring Guide](SKILL_AUTHORING_GUIDE.md) for best practices on 
 
 - Ableton Live 11+ (any edition)
 - Python 3.10+
-- [uv](https://docs.astral.sh/uv/) (recommended) or pip
+- pip (use a current release)
+
+### Security defaults in this fork
+
+This fork is **read-only by default** in both the MCP process and the Remote
+Script running inside Ableton. It also redacts absolute audio-file paths,
+limits clients and message sizes, and requires per-call confirmation for
+destructive tools. Port 9877 intentionally has no authentication, but is bound
+explicitly to `127.0.0.1`; disable the control surface when it is not in use.
+
+Safety settings are read once when each process starts:
+
+| Variable | Default | Effect |
+|---|---:|---|
+| `ABLETON_MCP_READ_ONLY` | `1` | Blocks every state-changing command |
+| `ABLETON_MCP_ALLOW_DESTRUCTIVE` | `0` | Additional gate for deletion/clearing tools |
+| `ABLETON_MCP_REDACT_FILE_PATHS` | `1` | Replaces absolute audio paths with `<redacted>` |
+| `ABLETON_MCP_ALLOW_CUSTOM_MODEL_SOURCE` | `0` | Blocks caller-selected model repositories |
+
+To compose or mix, set `ABLETON_MCP_READ_ONLY=0` for **both** Ableton and the
+MCP server, then restart both. To delete or clear content, additionally set
+`ABLETON_MCP_ALLOW_DESTRUCTIVE=1`; every destructive tool call must still pass
+`confirm_destructive=true` after explicit user confirmation.
+
+On macOS, GUI applications do not normally inherit shell variables. Set the
+Ableton-side values before launching Live, for example:
+
+```bash
+launchctl setenv ABLETON_MCP_READ_ONLY 0
+launchctl setenv ABLETON_MCP_ALLOW_DESTRUCTIVE 0
+launchctl setenv ABLETON_MCP_REDACT_FILE_PATHS 1
+```
+
+For a managed work computer, obtain employer approval first and keep path
+redaction enabled. Track names, notes, device settings, and other Live-set data
+returned by tools can still be sent to the configured AI provider.
 
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/nicholasbien/ableton-mcp-pro.git
+git clone https://github.com/KoJoVe/ableton-mcp-pro.git
 cd ableton-mcp-pro
 ```
+
+Install the core server into a dedicated environment using the hash-locked
+dependency set:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install --require-hashes -r requirements.lock
+.venv/bin/python -m pip install --no-deps -e .
+```
+
+The optional AI dependency graph is captured in `pylock.ai.toml` for Python
+3.12 on Apple Silicon. Regenerate it for a different platform before use.
 
 ### 2. Install the Remote Script in Ableton
 
@@ -113,14 +160,16 @@ Add to your `.mcp.json` in the project root:
 {
   "mcpServers": {
     "AbletonMCP": {
-      "command": "uv",
-      "args": [
-        "run",
-        "--project", "/path/to/ableton-mcp-pro",
-        "python",
-        "/path/to/ableton-mcp-pro/MCP_Server/server.py"
-      ]
-    }
+        "command": "/path/to/ableton-mcp-pro/.venv/bin/python",
+        "args": [
+          "/path/to/ableton-mcp-pro/MCP_Server/server.py"
+        ],
+        "env": {
+          "ABLETON_MCP_READ_ONLY": "1",
+          "ABLETON_MCP_ALLOW_DESTRUCTIVE": "0",
+          "ABLETON_MCP_REDACT_FILE_PATHS": "1"
+        }
+      }
   }
 }
 ```
@@ -133,19 +182,21 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (Mac) or 
 {
   "mcpServers": {
     "AbletonMCP": {
-      "command": "/opt/homebrew/bin/uv",
-      "args": [
-        "run",
-        "--project", "/path/to/ableton-mcp-pro",
-        "python",
-        "/path/to/ableton-mcp-pro/MCP_Server/server.py"
-      ]
-    }
+        "command": "/path/to/ableton-mcp-pro/.venv/bin/python",
+        "args": [
+          "/path/to/ableton-mcp-pro/MCP_Server/server.py"
+        ],
+        "env": {
+          "ABLETON_MCP_READ_ONLY": "1",
+          "ABLETON_MCP_ALLOW_DESTRUCTIVE": "0",
+          "ABLETON_MCP_REDACT_FILE_PATHS": "1"
+        }
+      }
   }
 }
 ```
 
-> Replace `/path/to/ableton-mcp-pro` with the actual path where you cloned the repo. If you don't have `uv`, you can use `pip install -e .` and replace the command with `python` and args with just the server path.
+> Replace `/path/to/ableton-mcp-pro` with the actual path where you cloned the repo.
 
 #### Cursor
 

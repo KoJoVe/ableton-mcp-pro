@@ -12,11 +12,22 @@ is auto-downloaded from
 [huggingface.co/nicholasbien/midigenai](https://huggingface.co/nicholasbien/midigenai)
 on first use and cached at `~/.cache/huggingface/`.
 
+### Model security
+
+This fork pins the default model to an immutable Hugging Face revision and
+verifies SHA-256 hashes for both the checkpoint and tokenizer before loading.
+It forces PyTorch's restricted `weights_only=True` unpickler even though the
+upstream dependency currently requests unrestricted loading.
+
+Caller-selected repositories, versions, or revisions are rejected by default.
+Do not set `ABLETON_MCP_ALLOW_CUSTOM_MODEL_SOURCE=1` unless you have audited the
+source; restricted loading reduces code-execution risk but does not make an
+arbitrary checkpoint harmless against denial-of-service or parser flaws.
+
 ### Setup
 
-```bash
-pip install "ableton-mcp-pro[ai]"
-```
+Use the platform-specific `pylock.ai.toml` with a current pip release, or
+regenerate that lockfile for your Python/platform combination before install.
 
 That installs `midigenai`, `torch`, `miditok`, `symusic`, and
 `huggingface_hub`. No separate repo clone, no extra venv.
@@ -80,34 +91,16 @@ drops cleanly into a fresh clip starting at beat 0.
 | `top_k` | nucleus sampling K |
 | `prompt_end_beat` | drop output notes that start before this beat (= filter out the prompt itself) |
 | `pitch_range` | optional `[min, max]` MIDI pitch filter — useful when you only want, say, the lead range |
-| `version` | which subfolder of the HF repo to load. Defaults to `MIDIGENAI_VERSION` env var, then `v2-100m`. |
-| `repo_id` | HF model repo. Defaults to `MIDIGENAI_REPO_ID` env var, then `nicholasbien/midigenai`. |
+| `version` | Pinned model subfolder. Overrides are disabled by default. |
+| `revision` | Pinned immutable Hugging Face commit. Overrides are disabled by default. |
+| `repo_id` | Pinned Hugging Face repository. Overrides are disabled by default. |
 
 ### Switching to a new model release
 
-Three ways to point the bridge at a different version, in increasing scope:
-
-```bash
-# 1) Per-call (just for one generation):
-echo '{ "notes": [...], "version": "v2" }' | python tools/midigenai_bridge.py
-
-# 2) Per shell session:
-export MIDIGENAI_VERSION=v2
-python tools/midigenai_bridge.py < cfg.json
-
-# 3) Permanent: bump DEFAULT_VERSION in midigenai/v2/hub.py
-```
-
-To see what's published:
-
-```python
-from midigenai import list_hub_versions
-list_hub_versions()         # ['v2-100m', 'v2-pilot']  # 100M is the current default
-```
-
-Adding a new version on the model author side = upload `ckpt_final.pt` and
-`tokenizer.json` to a new subfolder of the HF model repo. No code changes
-needed in midigenai or the bridge — both auto-discover.
+Treat every model update like a code update. Review the source, choose an
+immutable Hugging Face commit, calculate SHA-256 hashes for the checkpoint and
+tokenizer, update the pinned constants in `midigenai_bridge.py`, regenerate the
+AI lockfile, and rerun the security tests. Do not use a floating branch or tag.
 
 ### Wiring it into the Ableton workflow
 

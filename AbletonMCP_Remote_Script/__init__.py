@@ -2,6 +2,7 @@
 from __future__ import absolute_import, print_function, unicode_literals
 
 from _Framework.ControlSurface import ControlSurface
+import os
 import socket
 import json
 import threading
@@ -16,7 +17,63 @@ except ImportError:
 
 # Constants for socket communication
 DEFAULT_PORT = 9877
-HOST = "localhost"
+HOST = "127.0.0.1"
+MAX_CLIENTS = 4
+CLIENT_IDLE_TIMEOUT = 30.0
+MAX_MESSAGE_BYTES = 1024 * 1024
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
+
+def _env_flag(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+# Enforced inside Ableton so callers cannot bypass safety by skipping the MCP server.
+READ_ONLY_MODE = _env_flag("ABLETON_MCP_READ_ONLY", True)
+ALLOW_DESTRUCTIVE = _env_flag("ABLETON_MCP_ALLOW_DESTRUCTIVE", False)
+REDACT_FILE_PATHS = _env_flag("ABLETON_MCP_REDACT_FILE_PATHS", True)
+
+MODIFYING_COMMANDS = set([
+    "create_midi_track", "create_audio_track", "set_track_name",
+    "create_clip", "create_audio_clip", "create_arrangement_audio_clip",
+    "create_arrangement_midi_clip", "delete_arrangement_clip",
+    "add_notes_to_clip", "set_clip_name", "set_tempo", "fire_clip",
+    "stop_clip", "set_device_parameter", "batch_set_device_parameters",
+    "start_playback", "stop_playback", "load_instrument_or_effect",
+    "load_browser_item", "set_track_volume", "set_track_panning",
+    "fire_scene", "set_song_time", "set_record_mode",
+    "set_arrangement_overdub", "set_back_to_arranger",
+    "set_arrangement_loop", "set_track_mute", "set_track_solo",
+    "delete_clip", "duplicate_clip", "create_scene", "delete_scene",
+    "set_scene_name", "delete_track", "record_arrangement",
+    "delete_device", "duplicate_track", "set_clip_loop", "set_track_arm",
+    "set_send_level", "set_time_signature", "set_track_monitoring",
+    "set_track_input_routing", "set_track_output_routing", "set_metronome",
+    "set_clip_envelope", "clear_clip_envelope", "undo", "redo",
+])
+
+DESTRUCTIVE_COMMANDS = set([
+    "delete_arrangement_clip", "delete_clip", "delete_scene", "delete_track",
+    "delete_device", "clear_clip_envelope",
+])
+
+
+class MessageTooLarge(Exception):
+    pass
+
+
+def _redact_sensitive(value):
+    if isinstance(value, dict):
+        return dict((
+            key,
+            "<redacted>" if key == "file_path" else _redact_sensitive(item),
+        ) for key, item in value.items())
+    if isinstance(value, list):
+        return [_redact_sensitive(item) for item in value]
+    return value
 
 def create_instance(c_instance):
     """Create and return the AbletonMCP script instance"""
@@ -33,6 +90,7 @@ class AbletonMCP(ControlSurface):
         # Socket server for communication
         self.server = None
         self.client_threads = []
+        self.client_slots = threading.BoundedSemaphore(MAX_CLIENTS)
         self.server_thread = None
         self.running = False
         
@@ -104,13 +162,23 @@ class AbletonMCP(ControlSurface):
                     self.log_message("Connection accepted from " + str(address))
                     self.show_message("AbletonMCP: Client connected")
                     
+                    if not self.client_slots.acquire(False):
+                        self.log_message("Rejected connection: client limit reached")
+                        client.close()
+                        continue
+
                     # Handle client in a separate thread
-                    client_thread = threading.Thread(
-                        target=self._handle_client,
-                        args=(client,)
-                    )
-                    client_thread.daemon = True
-                    client_thread.start()
+                    try:
+                        client_thread = threading.Thread(
+                            target=self._handle_client,
+                            args=(client,)
+                        )
+                        client_thread.daemon = True
+                        client_thread.start()
+                    except Exception:
+                        self.client_slots.release()
+                        client.close()
+                        raise
                     
                     # Keep track of client threads
                     self.client_threads.append(client_thread)
@@ -133,7 +201,7 @@ class AbletonMCP(ControlSurface):
     def _handle_client(self, client):
         """Handle communication with a connected client"""
         self.log_message("Client handler started")
-        client.settimeout(None)  # No timeout for client socket
+        client.settimeout(CLIENT_IDLE_TIMEOUT)
         buffer = ''  # Changed from b'' to '' for Python 2
         
         try:
@@ -154,6 +222,9 @@ class AbletonMCP(ControlSurface):
                     except AttributeError:
                         # Python 2: data is already string
                         buffer += data
+
+                    if len(buffer.encode('utf-8')) > MAX_MESSAGE_BYTES:
+                        raise MessageTooLarge("Command exceeds maximum message size")
                     
                     try:
                         # Try to parse command from buffer
@@ -168,10 +239,10 @@ class AbletonMCP(ControlSurface):
                         # Send the response with explicit encoding
                         try:
                             # Python 3: encode string to bytes
-                            client.sendall(json.dumps(response).encode('utf-8'))
+                            self._send_json(client, response)
                         except AttributeError:
                             # Python 2: string is already bytes
-                            client.sendall(json.dumps(response))
+                            self._send_json(client, response)
                     except ValueError:
                         # Incomplete data, wait for more
                         continue
@@ -187,10 +258,10 @@ class AbletonMCP(ControlSurface):
                     }
                     try:
                         # Python 3: encode string to bytes
-                        client.sendall(json.dumps(error_response).encode('utf-8'))
+                        self._send_json(client, error_response)
                     except AttributeError:
                         # Python 2: string is already bytes
-                        client.sendall(json.dumps(error_response))
+                        self._send_json(client, error_response)
                     except:
                         # If we can't send the error, the connection is probably dead
                         break
@@ -205,7 +276,23 @@ class AbletonMCP(ControlSurface):
                 client.close()
             except:
                 pass
+            try:
+                self.client_slots.release()
+            except ValueError:
+                pass
             self.log_message("Client handler stopped")
+
+    def _send_json(self, client, payload):
+        """Serialize and send a bounded JSON response."""
+        if REDACT_FILE_PATHS:
+            payload = _redact_sensitive(payload)
+        encoded = json.dumps(payload).encode('utf-8')
+        if len(encoded) > MAX_RESPONSE_BYTES:
+            encoded = json.dumps({
+                "status": "error",
+                "message": "Response exceeds maximum message size",
+            }).encode('utf-8')
+        client.sendall(encoded)
     
     def _process_command(self, command):
         """Process a command from the client and return a response"""
@@ -219,6 +306,42 @@ class AbletonMCP(ControlSurface):
             "status": "success",
             "result": {}
         }
+
+        if command_type == "get_security_status":
+            response["result"] = {
+                "read_only": READ_ONLY_MODE,
+                "destructive_operations_enabled": ALLOW_DESTRUCTIVE,
+                "destructive_confirmation_required": True,
+                "file_paths_redacted": REDACT_FILE_PATHS,
+                "max_clients": MAX_CLIENTS,
+                "client_idle_timeout_seconds": CLIENT_IDLE_TIMEOUT,
+                "max_message_bytes": MAX_MESSAGE_BYTES,
+                "max_response_bytes": MAX_RESPONSE_BYTES,
+            }
+            return response
+
+        if command_type in MODIFYING_COMMANDS and READ_ONLY_MODE:
+            response["status"] = "error"
+            response["message"] = (
+                "Blocked by read-only mode. Restart Ableton with "
+                "ABLETON_MCP_READ_ONLY=0 to allow changes."
+            )
+            return response
+
+        if command_type in DESTRUCTIVE_COMMANDS:
+            if not ALLOW_DESTRUCTIVE:
+                response["status"] = "error"
+                response["message"] = (
+                    "Destructive operations are disabled. Restart Ableton with "
+                    "ABLETON_MCP_ALLOW_DESTRUCTIVE=1 to enable them."
+                )
+                return response
+            if params.get("confirm_destructive") is not True:
+                response["status"] = "error"
+                response["message"] = (
+                    "Destructive operation requires confirm_destructive=true."
+                )
+                return response
         
         try:
             # Route the command to the appropriate handler
